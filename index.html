@@ -126,7 +126,7 @@ body.initializing #authorize, body.content #authorize { display: none; }
       if(now > total) {
         now = total;
       }
-      const p = (now / total * 100).toFixed() + '%'
+      const p = (now / total * 100).toFixed(2) + '%'
 
       el.innerHTML = what + ': ' + p;
     }
