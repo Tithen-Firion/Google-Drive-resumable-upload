@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <script type="text/javascript">
+    // Enter a client ID for a web application from the Google API Console:
+    //   https://console.developers.google.com/apis/credentials?project=_
+    // In your API Console project, add a JavaScript origin that corresponds
+    //   to the domain where you will be running the script.
+    var clientId = '552732314086-rakpvlobkvt0lbgfchobf1ar7btorkvr.apps.googleusercontent.com';
+
+    // And make sure to enable drive API
+  </script>
+
+  <title>Google Drive resumable upload</title>
+  <meta charset="utf-8">
+  <style>
+
+body:not(.authorized) #authorize { display: block; }
+body:not(.authorized) #content { display: none; }
+body.authorized #authorize { display: none; }
+body.authorized #content { display: block; }
+
+#initializing { display: none; }
+body.initializing #initializing { display: block; }
+body.initializing #authorize, body.content #authorize { display: none; }
+
+  </style>
+</head>
+<body class="initializing">
+  <div id="initializing">Initializing...</div>
+
+  <div id="authorize"><span>This is a test app just for my friends and family, if you want to use it yourself - fork this repo and replace the <code>clientId</code>.</span><br><button id="authorize-button">Authorize</button></div>
+
+  <div id="content">
+    <div>
+      <span>Logged in as <span id="email"></span></span>
+      <button id="signout-button">Sign Out</button>
+    </div>
+    <div>
+      <span>Select files:</span> <input type="file" id="fileinput" multiple="multiple">
+    </div>
+    <div>
+      <span id="progress"></span>
+    </div>
+  </div>
+
+
+  <script type="text/javascript">
+    var authorizeButton = document.getElementById('authorize-button');
+    var signoutButton = document.getElementById('signout-button');
+
+    // How to get full list:
+    // https://developers.google.com/discovery/v1/reference/apis/list
+    var discoveryDocs = [
+      'https://www.googleapis.com/discovery/v1/apis/drive/v3/rest',
+    ];
+
+    var scopes = 'https://www.googleapis.com/auth/drive.file';
+
+    function init() {
+      gapi.load('client:auth2', initClient);
+    }
+
+    function initClient() {
+      gapi.client.init({
+          discoveryDocs: discoveryDocs,
+          clientId: clientId,
+          scope: scopes,
+      }).then(function () {
+        // Listen for sign-in state changes.
+        gapi.auth2.getAuthInstance().isSignedIn.listen(updateSigninStatus);
+
+        // Handle the initial sign-in state.
+        updateSigninStatus(gapi.auth2.getAuthInstance().isSignedIn.get());
+
+        authorizeButton.onclick = handleAuthClick;
+        signoutButton.onclick = handleSignoutClick;
+        fileinput.onchange = handleFileSelect;
+
+        document.body.classList.remove('initializing');
+      }).catch(error => {
+        console.error(error);
+        alert(JSON.stringify(error));
+      });
+    }
+
+    function updateSigninStatus(isSignedIn) {
+      if (isSignedIn) {
+        document.body.classList.add('authorized');
+        makeApiCall();
+      } else {
+        document.body.classList.remove('authorized');
+        document.querySelector('#email').innerHTML = '...';
+      }
+    }
+
+    function handleAuthClick(event) {
+      gapi.auth2.getAuthInstance().signIn();
+    }
+
+    function handleSignoutClick(event) {
+      gapi.auth2.getAuthInstance().signOut();
+    }
+
+    function makeApiCall() {
+      gapi.client.drive.about.get({
+        //'fields': 'user/displayName,user/emailAddress,storageQuota/limit,storageQuota/usage'
+        'fields': 'user/emailAddress'
+      }).then(function(resp) {
+        document.querySelector('#email').innerHTML = resp.result.user.emailAddress;
+      }).catch(error => {
+        console.error(error);
+        alert(JSON.stringify(error));
+      });
+    }
+
+    function progress(what, now, total) {
+      const el = document.querySelector('#progress');
+
+      if(!what) {
+        el.innerHTML = '';
+        return;
+      }
+
+      if(now > total) {
+        now = total;
+      }
+      const p = (now / total * 100).toFixed() + '%'
+
+      el.innerHTML = what + ': ' + p;
+    }
+
+    function fileCache(operation, fileKey, url) {
+      const cache = JSON.parse(localStorage.getItem('cache')) || {};
+
+      for(const [k, v] of Object.entries(cache)) {
+        if(v[1] + 604800000 <= Date.now())
+          delete cache[k]
+      }
+
+      if(operation === 'get') {
+        try {
+          return cache[fileKey][0];
+        }
+        catch(ignore) {
+          return null;
+        }
+      }
+      else if(operation === 'set') {
+        cache[fileKey] = [url, Date.now()];
+      }
+      else if(operation === 'delete') {
+        delete cache[fileKey];
+      }
+      
+      localStorage.setItem('cache', JSON.stringify(cache))
+    }
+
+    async function getHash(fileId) {
+      return new Promise((resolve, reject) => {
+        gapi.client.drive.files.get({
+          fileId: fileId,
+          fields: 'md5Checksum',
+        }).then(resp => {
+          resolve(resp.result.md5Checksum);
+        }).catch(e => {
+          reject(e);
+        });
+      });
+    }
+
+    function uploadFile(file) {
+      return new Promise(async (resolve, reject) => {
+        progress(null);
+
+        const md5 = await hashFile(file, progress.bind(null, `hashing ${file.name}`));
+        const fileKey = `${md5}_${file.size}_${file.name}`;
+
+        let url = fileCache('get', fileKey);
+        let i = 0;
+        //console.log(fileKey, url)
+        //return
+
+        //url = 'https://www.googleapis.com/upload/drive/v3/files/?uploadType=resumable&upload_id=ADPycdsNKnDBz62UOx4P3bb8DWUQIBixPfEjaHUWe7txWhEdYgWzxz4ovvNGhOIhkQJKjQoczSECNsZt6xMfgurqrPOuoK5LWg'
+
+        const p = progress.bind(null, `uploading ${file.name}`)
+
+        const uploader = new window.UploaderForGoogleDrive({
+          file: file,
+          onComplete: async r => {
+            try {
+              r = JSON.parse(r);
+            }
+            catch (e) {
+              reject(e);
+              return;
+            }
+
+            let h = null;
+            for(let i=0; i < 5; ++i) {
+              try {
+                h = await getHash(r.id);
+                break;
+              }
+              catch(ignore) {}
+            }
+
+            if(h === md5) {
+              fileCache('delete', fileKey);
+              resolve();
+            }
+            else if(h === null) {
+              reject("Can't confirm if the file was uploaded properly, try again later.");
+            }
+            else {
+              fileCache('delete', fileKey);
+              reject('File was uploaded but the one on your Google Drive is corrupted, you have to restart the upload.');
+            }
+          },
+          onError: reject,
+          onProgress: e => {
+            // update the time in cache but not too often
+            if(i % 50 == 0) {
+              fileCache('set', fileKey, uploader.url);
+            }
+            ++i;
+
+            p(uploader.offset + e.loaded, uploader.offset + e.total);
+          },
+        });
+
+        if(url === null)
+          uploader.upload();
+        else {
+          uploader.url = url;
+          uploader.resume_();
+        }
+      });
+    }
+
+    async function handleFileSelect(event) {
+      for(const file of event.target.files) {
+        try {
+          await uploadFile(file);
+        }
+        catch(error) {
+          console.error(error);
+          alert(error);
+        }
+
+        document.querySelector('#progress').innerHTML = 'all done!';
+        alert('all done!');
+      }
+    }
+
+    const hashFile = (() => {
+      // slightly modified from https://stackoverflow.com/a/63287199/2428152
+
+      const chunkSize = 8 * 1024 * 1024;
+      const fileReader = new FileReader();
+      let hasher = null;
+
+      function hashChunk(chunk) {
+        return new Promise((resolve, reject) => {
+          fileReader.onload = async(e) => {
+            const view = new Uint8Array(e.target.result);
+            hasher.update(view);
+            resolve();
+          };
+
+          fileReader.readAsArrayBuffer(chunk);
+        });
+      }
+
+      const hashFile = async (file, progress) => {
+        if (hasher) {
+          hasher.init();
+        } else {
+          hasher = await hashwasm.createMD5();
+        }
+
+        const chunkNumber = Math.floor(file.size / chunkSize);
+
+        progress(0, file.size);
+        for (let i = 0; i <= chunkNumber; i++) {
+          const end = Math.min(chunkSize * (i + 1), file.size);
+          const chunk = file.slice(
+            chunkSize * i,
+            end
+          );
+          await hashChunk(chunk);
+          progress(end, file.size);
+        }
+
+        const hash = hasher.digest();
+        return hash;
+      };
+
+      return hashFile;
+    })();
+  </script>
+
+  <script src="UploaderForGoogleDrive.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/hash-wasm@4.9.0/dist/md5.umd.min.js" integrity="sha256-MtseEx7eZnOf4aGwLrvd5j6pzR/+Uc2wqGlZNJeUCI0=" crossorigin="anonymous"></script>
+  <script src="https://apis.google.com/js/platform.js?onload=init" defer></script>
+</body>
+
+</html>
